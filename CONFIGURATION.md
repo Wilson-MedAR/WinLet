@@ -192,6 +192,39 @@ interval_seconds = 60
 failure_threshold = 1
 ```
 
+## Graceful Stop Hook
+
+By default, when the service is stopped WinLet sends **Ctrl+C** to the process and force-kills it after
+`shutdown_timeout_seconds`. For a **console-less service child**, that Ctrl+C often cannot be delivered, so
+the process is force-killed — risky for anything mid-write to a database or file.
+
+A **stop hook** lets the managed process shut *itself* down cleanly first. On stop, WinLet invokes the hook
+(an HTTP request or a command) and waits for the process to exit; only if it does not exit within
+`timeout_seconds` does WinLet fall back to Ctrl+C and then a force kill.
+
+### HTTP Stop Hook (call a shutdown endpoint)
+
+```toml
+[process.stop_hook]
+type = "http"
+url = "http://localhost:3000/admin/stop"   # your app's graceful-shutdown endpoint
+method = "POST"                              # default POST
+timeout_seconds = 30                         # wait this long for the process to exit
+```
+
+### Command Stop Hook (run a shutdown command)
+
+```toml
+[process.stop_hook]
+type = "command"
+command = "C:\\Apps\\MyApp\\shutdown.exe"
+arguments = "--graceful"
+timeout_seconds = 30
+```
+
+If the hook is omitted, behavior is unchanged (Ctrl+C → force kill). A failed or missing hook simply falls
+through to the default stop path — the hook never blocks a stop from completing.
+
 ## Service Accounts
 
 ### Local System (Default)

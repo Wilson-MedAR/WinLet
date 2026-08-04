@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 
@@ -206,6 +207,19 @@ public class ProcessRunner : IDisposable
 
         try
         {
+            // Graceful stop hook (if configured): ask the process to shut ITSELF down cleanly before
+            // any signal or kill, so a process mid-write to a DB/file can finish. If it exits within
+            // the hook timeout we are done; otherwise fall through to Ctrl+C -> force kill below.
+            if (_config.Process.StopHook is { } stopHook)
+            {
+                if (await TryStopHookAsync(stopHook, cancellationToken))
+                {
+                    _logger.LogInformation("Process exited gracefully via stop hook");
+                    return;
+                }
+                _logger.LogWarning("Stop hook did not stop the process in time; falling back to signal/kill");
+            }
+
             // Try graceful shutdown first - attempt GUI close
             bool sentGracefulSignal = false;
             
@@ -261,6 +275,87 @@ public class ProcessRunner : IDisposable
         finally
         {
             _cancellationTokenSource.Cancel();
+        }
+    }
+
+    /// <summary>
+    /// Invoke the configured graceful stop hook (an HTTP request or a command) and wait up to the
+    /// hook's timeout for the managed process to exit. Returns true if the process exited — letting
+    /// the caller skip the Ctrl+C / force-kill fallback. Never throws: a failed hook returns false.
+    /// </summary>
+    private async Task<bool> TryStopHookAsync(StopHookConfig hook, CancellationToken cancellationToken)
+    {
+        if (_process == null)
+            return true;
+
+        try
+        {
+            if (hook.Type == StopHookType.Http)
+            {
+                if (string.IsNullOrWhiteSpace(hook.Url))
+                {
+                    _logger.LogWarning("Stop hook type=Http but no url configured; skipping hook");
+                    return false;
+                }
+
+                _logger.LogInformation("Invoking stop hook: {Method} {Url}", hook.Method, hook.Url);
+                using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(Math.Max(5, hook.TimeoutSeconds)) };
+                using var request = new HttpRequestMessage(new HttpMethod(hook.Method), hook.Url);
+                try
+                {
+                    await httpClient.SendAsync(request, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Stop hook HTTP call failed: {Message}", ex.Message);
+                }
+            }
+            else // Command
+            {
+                if (string.IsNullOrWhiteSpace(hook.Command))
+                {
+                    _logger.LogWarning("Stop hook type=Command but no command configured; skipping hook");
+                    return false;
+                }
+
+                _logger.LogInformation("Invoking stop hook command: {Command} {Arguments}", hook.Command, hook.Arguments);
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = hook.Command,
+                    Arguments = hook.Arguments ?? string.Empty,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                try
+                {
+                    using var hookProcess = Process.Start(startInfo);
+                    if (hookProcess != null)
+                        await hookProcess.WaitForExitAsync(cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Stop hook command failed: {Message}", ex.Message);
+                }
+            }
+
+            // Wait for the MANAGED process to exit within the hook timeout.
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, hook.TimeoutSeconds)));
+            try
+            {
+                await _process.WaitForExitAsync(timeoutCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // timed out waiting for exit — caller falls back to signal/kill
+            }
+
+            return _process.HasExited;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Stop hook error: {Message}", ex.Message);
+            return _process.HasExited;
         }
     }
 
