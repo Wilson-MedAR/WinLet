@@ -288,6 +288,15 @@ public class ProcessRunner : IDisposable
         if (_process == null)
             return true;
 
+        // ONE linked deadline across the WHOLE hook: invoking it (HTTP send / running the command) AND
+        // then waiting for the managed process to exit must TOGETHER fit inside hook.TimeoutSeconds —
+        // not once per phase. Previously the HTTP call (or an unbounded command wait) could consume the
+        // full timeout, and the managed-process wait a second full timeout, so a hung shutdown command
+        // could exceed the deadline and a total stop could take ~2x TimeoutSeconds.
+        using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadlineCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, hook.TimeoutSeconds)));
+        var deadline = deadlineCts.Token;
+
         try
         {
             if (hook.Type == StopHookType.Http)
@@ -299,11 +308,17 @@ public class ProcessRunner : IDisposable
                 }
 
                 _logger.LogInformation("Invoking stop hook: {Method} {Url}", hook.Method, hook.Url);
-                using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(Math.Max(5, hook.TimeoutSeconds)) };
+                // Timeout.InfiniteTimeSpan: the shared `deadline` token is the sole bound, so the HTTP
+                // call cannot outlive the hook deadline nor claim its own separate timeout budget.
+                using var httpClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
                 using var request = new HttpRequestMessage(new HttpMethod(hook.Method), hook.Url);
                 try
                 {
-                    await httpClient.SendAsync(request, cancellationToken);
+                    await httpClient.SendAsync(request, deadline);
+                }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+                {
+                    _logger.LogWarning("Stop hook HTTP call did not complete within the {Timeout}s hook deadline", hook.TimeoutSeconds);
                 }
                 catch (Exception ex)
                 {
@@ -330,7 +345,13 @@ public class ProcessRunner : IDisposable
                 {
                     using var hookProcess = Process.Start(startInfo);
                     if (hookProcess != null)
-                        await hookProcess.WaitForExitAsync(cancellationToken);
+                        // Bound the command by the SHARED deadline, not the caller token — a hung
+                        // shutdown command can no longer exceed hook.TimeoutSeconds.
+                        await hookProcess.WaitForExitAsync(deadline);
+                }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+                {
+                    _logger.LogWarning("Stop hook command did not complete within the {Timeout}s hook deadline", hook.TimeoutSeconds);
                 }
                 catch (Exception ex)
                 {
@@ -338,16 +359,14 @@ public class ProcessRunner : IDisposable
                 }
             }
 
-            // Wait for the MANAGED process to exit within the hook timeout.
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, hook.TimeoutSeconds)));
+            // Wait for the MANAGED process to exit within whatever remains of the SAME deadline.
             try
             {
-                await _process.WaitForExitAsync(timeoutCts.Token);
+                await _process.WaitForExitAsync(deadline);
             }
             catch (OperationCanceledException)
             {
-                // timed out waiting for exit — caller falls back to signal/kill
+                // deadline hit (hook + wait together) — caller falls back to signal/kill
             }
 
             return _process.HasExited;
