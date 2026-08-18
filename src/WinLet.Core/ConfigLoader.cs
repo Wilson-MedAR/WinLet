@@ -161,6 +161,9 @@ public class ConfigLoader
         if (processTable.TryGetValue("shutdown_timeout_seconds", out var timeout))
             process.ShutdownTimeoutSeconds = Convert.ToInt32(timeout);
 
+        if (processTable.TryGetValue("stop_hook", out var stopHookObj) && stopHookObj is TomlTable stopHookTable)
+            process.StopHook = MapStopHookConfig(stopHookTable);
+
         // Map environment variables
         if (processTable.TryGetValue("environment", out var envObj) && envObj is TomlTable envTable)
         {
@@ -282,6 +285,26 @@ public class ConfigLoader
             health.FailureThreshold = Convert.ToInt32(threshold);
 
         return health;
+    }
+
+    private static StopHookConfig MapStopHookConfig(TomlTable table)
+    {
+        var hook = new StopHookConfig();
+
+        if (table.TryGetValue("type", out var type) && Enum.TryParse<StopHookType>(type.ToString(), true, out var t))
+            hook.Type = t;
+        if (table.TryGetValue("url", out var url))
+            hook.Url = url.ToString();
+        if (table.TryGetValue("method", out var method))
+            hook.Method = method.ToString() ?? "POST";
+        if (table.TryGetValue("command", out var command))
+            hook.Command = command.ToString();
+        if (table.TryGetValue("arguments", out var args))
+            hook.Arguments = args.ToString();
+        if (table.TryGetValue("timeout_seconds", out var timeout))
+            hook.TimeoutSeconds = Convert.ToInt32(timeout);
+
+        return hook;
     }
 
     private static ServiceAccountConfig MapServiceAccountConfig(TomlTable serviceAccountTable)

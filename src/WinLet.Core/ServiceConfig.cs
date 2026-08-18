@@ -47,6 +47,46 @@ public class ProcessConfig
     /// Timeout in seconds for graceful shutdown
     /// </summary>
     public int ShutdownTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Optional graceful stop hook invoked BEFORE any Ctrl+C / force kill: an HTTP request or a
+    /// command that asks the managed process to shut itself down cleanly (finish in-flight work).
+    /// Essential for a process mid-write to a database or file, where a force kill risks corruption.
+    /// </summary>
+    public StopHookConfig? StopHook { get; set; }
+}
+
+/// <summary>
+/// A graceful shutdown hook. On stop, WinLet invokes this first and waits for the managed process to
+/// exit; only if it does not exit within <see cref="TimeoutSeconds"/> does WinLet fall back to the
+/// Ctrl+C signal and then a force kill. Ideal for services that expose a shutdown endpoint or command.
+/// </summary>
+public class StopHookConfig
+{
+    /// <summary>How to request graceful shutdown: Http (default) or Command.</summary>
+    public StopHookType Type { get; set; } = StopHookType.Http;
+
+    /// <summary>For Type=Http: the URL to call, e.g. http://localhost:8730/admin/stop.</summary>
+    public string? Url { get; set; }
+
+    /// <summary>For Type=Http: the HTTP method (default POST).</summary>
+    public string Method { get; set; } = "POST";
+
+    /// <summary>For Type=Command: the executable to run.</summary>
+    public string? Command { get; set; }
+
+    /// <summary>For Type=Command: arguments passed to the executable.</summary>
+    public string? Arguments { get; set; }
+
+    /// <summary>Seconds to wait for the process to exit after invoking the hook (default 30).</summary>
+    public int TimeoutSeconds { get; set; } = 30;
+}
+
+/// <summary>How a <see cref="StopHookConfig"/> requests graceful shutdown.</summary>
+public enum StopHookType
+{
+    Http,
+    Command
 }
 
 /// <summary>

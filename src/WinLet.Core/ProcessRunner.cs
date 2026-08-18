@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 
@@ -206,6 +207,19 @@ public class ProcessRunner : IDisposable
 
         try
         {
+            // Graceful stop hook (if configured): ask the process to shut ITSELF down cleanly before
+            // any signal or kill, so a process mid-write to a DB/file can finish. If it exits within
+            // the hook timeout we are done; otherwise fall through to Ctrl+C -> force kill below.
+            if (_config.Process.StopHook is { } stopHook)
+            {
+                if (await TryStopHookAsync(stopHook, cancellationToken))
+                {
+                    _logger.LogInformation("Process exited gracefully via stop hook");
+                    return;
+                }
+                _logger.LogWarning("Stop hook did not stop the process in time; falling back to signal/kill");
+            }
+
             // Try graceful shutdown first - attempt GUI close
             bool sentGracefulSignal = false;
             
@@ -261,6 +275,106 @@ public class ProcessRunner : IDisposable
         finally
         {
             _cancellationTokenSource.Cancel();
+        }
+    }
+
+    /// <summary>
+    /// Invoke the configured graceful stop hook (an HTTP request or a command) and wait up to the
+    /// hook's timeout for the managed process to exit. Returns true if the process exited — letting
+    /// the caller skip the Ctrl+C / force-kill fallback. Never throws: a failed hook returns false.
+    /// </summary>
+    private async Task<bool> TryStopHookAsync(StopHookConfig hook, CancellationToken cancellationToken)
+    {
+        if (_process == null)
+            return true;
+
+        // ONE linked deadline across the WHOLE hook: invoking it (HTTP send / running the command) AND
+        // then waiting for the managed process to exit must TOGETHER fit inside hook.TimeoutSeconds —
+        // not once per phase. Previously the HTTP call (or an unbounded command wait) could consume the
+        // full timeout, and the managed-process wait a second full timeout, so a hung shutdown command
+        // could exceed the deadline and a total stop could take ~2x TimeoutSeconds.
+        using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadlineCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, hook.TimeoutSeconds)));
+        var deadline = deadlineCts.Token;
+
+        try
+        {
+            if (hook.Type == StopHookType.Http)
+            {
+                if (string.IsNullOrWhiteSpace(hook.Url))
+                {
+                    _logger.LogWarning("Stop hook type=Http but no url configured; skipping hook");
+                    return false;
+                }
+
+                _logger.LogInformation("Invoking stop hook: {Method} {Url}", hook.Method, hook.Url);
+                // Timeout.InfiniteTimeSpan: the shared `deadline` token is the sole bound, so the HTTP
+                // call cannot outlive the hook deadline nor claim its own separate timeout budget.
+                using var httpClient = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+                using var request = new HttpRequestMessage(new HttpMethod(hook.Method), hook.Url);
+                try
+                {
+                    await httpClient.SendAsync(request, deadline);
+                }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+                {
+                    _logger.LogWarning("Stop hook HTTP call did not complete within the {Timeout}s hook deadline", hook.TimeoutSeconds);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Stop hook HTTP call failed: {Message}", ex.Message);
+                }
+            }
+            else // Command
+            {
+                if (string.IsNullOrWhiteSpace(hook.Command))
+                {
+                    _logger.LogWarning("Stop hook type=Command but no command configured; skipping hook");
+                    return false;
+                }
+
+                _logger.LogInformation("Invoking stop hook command: {Command} {Arguments}", hook.Command, hook.Arguments);
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = hook.Command,
+                    Arguments = hook.Arguments ?? string.Empty,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                try
+                {
+                    using var hookProcess = Process.Start(startInfo);
+                    if (hookProcess != null)
+                        // Bound the command by the SHARED deadline, not the caller token — a hung
+                        // shutdown command can no longer exceed hook.TimeoutSeconds.
+                        await hookProcess.WaitForExitAsync(deadline);
+                }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+                {
+                    _logger.LogWarning("Stop hook command did not complete within the {Timeout}s hook deadline", hook.TimeoutSeconds);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Stop hook command failed: {Message}", ex.Message);
+                }
+            }
+
+            // Wait for the MANAGED process to exit within whatever remains of the SAME deadline.
+            try
+            {
+                await _process.WaitForExitAsync(deadline);
+            }
+            catch (OperationCanceledException)
+            {
+                // deadline hit (hook + wait together) — caller falls back to signal/kill
+            }
+
+            return _process.HasExited;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Stop hook error: {Message}", ex.Message);
+            return _process.HasExited;
         }
     }
 
