@@ -44,9 +44,7 @@ public class ConfigLoader
     {
         try
         {
-            // Preprocess TOML content to handle Windows paths with backslashes
-            var processedContent = PreprocessTomlContent(tomlContent);
-            var tomlTable = Toml.ToModel(processedContent);
+            var tomlTable = ParseToml(tomlContent);
             var config = MapToServiceConfig(tomlTable);
             
             ValidateConfiguration(config);
@@ -68,7 +66,61 @@ public class ConfigLoader
     }
 
     /// <summary>
-    /// Preprocess TOML content to handle Windows paths with backslashes
+    /// Parse the TOML AS WRITTEN first. Only a document that does NOT parse falls back to the legacy Windows-path
+    /// preprocessor (raw single backslashes such as "C:\Program Files\x"). Running the preprocessor on VALID TOML
+    /// doubled every backslash in any string starting with a drive path, which silently corrupted correctly escaped
+    /// values: a "--server host\\inst" argument arrived as host\\inst, and a "D:\\x;\\\\host\\share" root list
+    /// resolved its UNC half to a local folder (MedAR SD-018).
+    /// </summary>
+    private static TomlTable ParseToml(string tomlContent)
+    {
+        TomlTable table;
+        try
+        {
+            table = Toml.ToModel(tomlContent);
+        }
+        catch (Exception) when (PreprocessTomlContent(tomlContent) != tomlContent)
+        {
+            table = Toml.ToModel(PreprocessTomlContent(tomlContent));
+        }
+
+        // A valid parse can still hide an unescaped path: "C:\temp" is legal TOML whose \t is a TAB. No config value
+        // legitimately holds a control character, so refuse instead of starting a process with a mangled path.
+        var bad = FindControlCharacter(table, string.Empty);
+        if (bad != null)
+        {
+            throw new ConfigurationException(
+                $"Configuration value '{bad}' contains a control character (tab, newline, ...). This is usually an " +
+                "unescaped Windows path such as \"C:\\temp\". Write it as a literal string ('C:\\temp') or escape " +
+                "each backslash (\"C:\\\\temp\").");
+        }
+        return table;
+    }
+
+    private static string? FindControlCharacter(TomlTable table, string prefix)
+    {
+        foreach (var (key, value) in table)
+        {
+            var path = prefix.Length == 0 ? key : $"{prefix}.{key}";
+            switch (value)
+            {
+                case string s when s.Any(char.IsControl):
+                    return path;
+                case TomlTable nested when FindControlCharacter(nested, path) is { } hit:
+                    return hit;
+                case TomlArray array:
+                    foreach (var item in array)
+                    {
+                        if (item is string a && a.Any(char.IsControl)) return path;
+                    }
+                    break;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// LEGACY fallback only (see ParseToml): escape raw backslashes in double-quoted Windows paths
     /// </summary>
     /// <param name="tomlContent">Original TOML content</param>
     /// <returns>Processed TOML content with properly escaped backslashes</returns>
