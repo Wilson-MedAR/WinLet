@@ -62,6 +62,20 @@ public class ConfigLoaderBackslashTests
     }
 
     [Fact]
+    public void MixedDocument_RawPathIsRescued_EscapedValuesAreNotReDoubled()
+    {
+        // REV: one raw path makes the whole document fail to parse. The fallback must fix ONLY that string, not
+        // re-double the correctly escaped ones beside it (the original bug, back through the fallback).
+        var config = Load(
+            "executable = \"C:\\Program Files\\nodejs\\node.exe\"\n" +
+            "arguments = \"C:\\\\DEV\\\\probe.mjs --server medarms03\\\\SQLEXPRESS\"",
+            "DOC_ROOTS = \"D:\\\\SXServer;\\\\\\\\fixturehost\\\\share\"");
+        Assert.Equal(@"C:\Program Files\nodejs\node.exe", config.Process.Executable);
+        Assert.Equal(@"C:\DEV\probe.mjs --server medarms03\SQLEXPRESS", config.Process.Arguments);
+        Assert.Equal(@"D:\SXServer;\\fixturehost\share", config.Process.Environment["DOC_ROOTS"]);
+    }
+
+    [Fact]
     public void UnescapedPathThatHappensToBeValidToml_IsRefusedNotMangled()
     {
         // "C:\temp" parses (\t is a TAB). Refuse loudly instead of running with a mangled value.

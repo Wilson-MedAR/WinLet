@@ -133,12 +133,31 @@ public class ConfigLoader
         var result = Regex.Replace(tomlContent, windowsPathPattern, match =>
         {
             var originalPath = match.Groups[1].Value;
-            // Escape backslashes for TOML parsing
+            // PER STRING: leave a string that is already a valid TOML basic string alone. Only a string that is
+            // invalid on its own (a raw "C:\Users\...") is escaped. Otherwise one raw path in a document re-doubled
+            // every correctly escaped "C:\\..." string beside it, which is the corruption this fallback must not cause.
+            if (IsValidBasicString(originalPath))
+            {
+                return match.Value;
+            }
             var escapedPath = originalPath.Replace(@"\", @"\\");
             return $"\"{escapedPath}\"";
         });
 
         return result;
+    }
+
+    private static bool IsValidBasicString(string content)
+    {
+        try
+        {
+            Toml.ToModel($"v = \"{content}\"");
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private static ServiceConfig MapToServiceConfig(TomlTable tomlTable)
