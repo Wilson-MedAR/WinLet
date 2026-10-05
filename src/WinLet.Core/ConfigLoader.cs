@@ -83,42 +83,49 @@ public class ConfigLoader
         {
             // Not in an exception filter: the preprocessor may throw a ConfigurationException ("mixed backslashes"),
             // and an exception thrown inside a filter is swallowed.
-            var preprocessed = PreprocessTomlContent(tomlContent);
-            if (preprocessed == tomlContent)
+            // Line endings are normalized for the rescue only (the line pattern is LF-anchored; generators write CRLF).
+            var normalized = tomlContent.Replace("\r\n", "\n");
+            var preprocessed = PreprocessTomlContent(normalized);
+            if (preprocessed == normalized)
             {
                 throw;
             }
             table = Toml.ToModel(preprocessed);
         }
 
-        // A valid parse can still hide an unescaped path: "C:\temp" is legal TOML whose \t is a TAB. No config value
-        // legitimately holds a control character, so refuse instead of starting a process with a mangled path.
-        var bad = FindControlCharacter(table, string.Empty);
+        // A valid parse can still hide an unescaped path: "C:\temp" is legal TOML whose \t is a TAB. Refuse instead of
+        // starting a process with a mangled path. Tab, backspace and form feed are never legitimate in a config value;
+        // a newline is (a multi-line env value), so CR/LF refuse only in a value that starts like a Windows path.
+        var bad = FindMangledValue(table, string.Empty);
         if (bad != null)
         {
             throw new ConfigurationException(
-                $"Configuration value '{bad}' contains a control character (tab, newline, ...). This is usually an " +
-                "unescaped Windows path such as \"C:\\temp\". Write it as a literal string ('C:\\temp') or escape " +
-                "each backslash (\"C:\\\\temp\").");
+                $"Configuration value '{bad}' contains a control character (tab, newline, ...) where a Windows path " +
+                "is expected: usually an unescaped backslash such as \"C:\\temp\" (\\t is a tab in TOML). Write it as " +
+                "a literal string ('C:\\temp') or escape each backslash (\"C:\\\\temp\").");
         }
         return table;
     }
 
-    private static string? FindControlCharacter(TomlTable table, string prefix)
+    private static bool LooksMangled(string s) =>
+        s.Any(c => c is '\t' or '\b' or '\f' || (char.IsControl(c) && c is not '\n' and not '\r')) ||
+        (Regex.IsMatch(s, @"^(?:[A-Za-z]:|\\)") && s.Any(c => c is '\n' or '\r'));
+
+    private static string? FindMangledValue(TomlTable table, string prefix)
     {
         foreach (var (key, value) in table)
         {
             var path = prefix.Length == 0 ? key : $"{prefix}.{key}";
             switch (value)
             {
-                case string s when s.Any(char.IsControl):
+                case string s when LooksMangled(s):
                     return path;
-                case TomlTable nested when FindControlCharacter(nested, path) is { } hit:
+                case TomlTable nested when FindMangledValue(nested, path) is { } hit:
                     return hit;
                 case TomlArray array:
                     foreach (var item in array)
                     {
-                        if (item is string a && a.Any(char.IsControl)) return path;
+                        if (item is string a && LooksMangled(a)) return path;
                     }
                     break;
             }
@@ -129,6 +136,8 @@ public class ConfigLoader
     // ONLY `key = "single-line basic string"` lines, optionally followed by a comment, whose value starts like a
     // Windows path ("X:\..." or "\\..."). Narrow on purpose: the fallback can never reach into literal strings
     // ('...'), multi-line strings, comments, arrays, or a second string on the same line.
+    private static readonly Regex TableHeader = new(@"^[ \t]*\[(?<name>[^\[\]\r\n]+)\][ \t]*(?:#[^\r\n]*)?$", RegexOptions.Multiline);
+
     private static readonly Regex WindowsPathValueLine = new(
         @"^(?<lead>[ \t]*[A-Za-z0-9_.-]+[ \t]*=[ \t]*)""(?<body>(?:[A-Za-z]:\\|\\\\)[^""\r\n]*)""(?<tail>[ \t]*(?:#[^\r\n]*)?)$",
         RegexOptions.Multiline);
@@ -148,10 +157,15 @@ public class ConfigLoader
             {
                 return match.Value;
             }
-            var afterUncPrefix = body.StartsWith(@"\\", StringComparison.Ordinal) ? body.Substring(2) : body;
-            if (afterUncPrefix.Contains(@"\\"))
+            // A "\\" that opens a ;-separated segment is a UNC prefix ("D:\SX;\\host\share"), not an escaped pair.
+            var isMixed = body.Split(';').Any(segment =>
+                (segment.StartsWith(@"\\", StringComparison.Ordinal) ? segment.Substring(2) : segment).Contains(@"\\"));
+            if (isMixed)
             {
-                var key = match.Groups["lead"].Value.Split('=')[0].Trim();
+                // Name the full table path (e.g. process.environment.DOC_ROOTS): the nearest [table] header above.
+                var header = TableHeader.Matches(tomlContent.Substring(0, match.Index)).Cast<Match>().LastOrDefault();
+                var bare = match.Groups["lead"].Value.Split('=')[0].Trim();
+                var key = header == null ? bare : $"{header.Groups["name"].Value.Trim()}.{bare}";
                 throw new ConfigurationException(
                     $"Configuration value '{key}' mixes escaped (\\\\) and raw (\\) backslashes, so it can't be read safely. " +
                     "Write it as a literal string ('C:\\path') or escape every backslash (\"C:\\\\path\").");

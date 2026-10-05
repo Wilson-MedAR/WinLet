@@ -81,7 +81,7 @@ public class ConfigLoaderBackslashTests
         // "C:\\Users\x": a valid escaped pair plus a raw backslash. Doubling all would corrupt the escaped half.
         var ex = Assert.Throws<ConfigurationException>(() =>
             Load("executable = \"node\"\narguments = \"C:\\\\Users\\x\\run.js\""));
-        Assert.Contains("'arguments'", ex.Message);
+        Assert.Contains("'process.arguments'", ex.Message);
         Assert.Contains("mixes escaped", ex.Message);
     }
 
@@ -112,6 +112,37 @@ public class ConfigLoaderBackslashTests
     }
 
     [Fact]
+    public void CrlfDocument_RawPathIsStillRescued()
+    {
+        // REV: our generator writes CRLF; the LF-anchored rescue used to miss every line.
+        var config = ConfigLoader.LoadFromString(
+            "[service]\r\nname = \"sd018-test\"\r\ndisplay_name = \"sd018-test\"\r\n\r\n" +
+            "[process]\r\nexecutable = \"C:\\Program Files\\nodejs\\node.exe\"\r\n" +
+            "arguments = \"C:\\\\DEV\\\\probe.mjs --server medarms03\\\\SQLEXPRESS\"\r\n");
+        Assert.Equal(@"C:\Program Files\nodejs\node.exe", config.Process.Executable);
+        Assert.Equal(@"C:\DEV\probe.mjs --server medarms03\SQLEXPRESS", config.Process.Arguments);
+    }
+
+    [Fact]
+    public void RawDriveAndUncRootList_IsRescuedNotCalledMixed()
+    {
+        // The DOC_ROOTS shape written raw: the "\\" opening the second segment is a UNC prefix.
+        var config = Load("executable = \"C:\\Program Files\\nodejs\\node.exe\"", "DOC_ROOTS = \"D:\\SX;\\\\fixturehost\\share\"");
+        Assert.Equal(@"D:\SX;\\fixturehost\share", config.Process.Environment["DOC_ROOTS"]);
+    }
+
+    [Fact]
+    public void RawPathInsideAnArray_IsNotRescued_AndReportsTheParseError()
+    {
+        // The rescue is deliberately narrow (key = "..." lines only); an array of raw paths fails closed.
+        var ex = Assert.Throws<ConfigurationException>(() =>
+            ConfigLoader.LoadFromString(
+                "[service]\nname = \"sd018-test\"\ndisplay_name = \"sd018-test\"\n\n" +
+                "[process]\nexecutable = \"node\"\npaths = [\"C:\\Program Files\\x\"]\n"));
+        Assert.Contains("Failed to parse TOML configuration", ex.Message);
+    }
+
+    [Fact]
     public void UnescapedPathThatHappensToBeValidToml_IsRefusedNotMangled()
     {
         // "C:\temp" parses (\t is a TAB). Refuse loudly instead of running with a mangled value.
@@ -119,6 +150,23 @@ public class ConfigLoaderBackslashTests
             Load("executable = \"node\"\narguments = \"C:\\temp\\run.js\""));
         Assert.Contains("process.arguments", ex.Message);
         Assert.Contains("control character", ex.Message);
+    }
+
+    [Fact]
+    public void MultiLineEnvironmentValue_IsAllowed()
+    {
+        // A newline is legitimate in a non-path value; only path-shaped values refuse CR/LF.
+        var config = Load("executable = \"node\"", "BANNER = \"line one\\nline two\"");
+        Assert.Equal("line one\nline two", config.Process.Environment["BANNER"]);
+    }
+
+    [Fact]
+    public void PathShapedValueWithANewline_IsRefused()
+    {
+        // "C:\new" is legal TOML whose \n is a newline: the classic unescaped path. (A path with ANY invalid escape,
+        // e.g. "C:\new\out", fails to parse as written and is rescued correctly instead.)
+        var ex = Assert.Throws<ConfigurationException>(() => Load("executable = \"node\"", "OUT = \"C:\\new\""));
+        Assert.Contains("process.environment.OUT", ex.Message);
     }
 
     [Fact]
