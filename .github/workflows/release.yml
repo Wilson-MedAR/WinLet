@@ -79,6 +79,10 @@ jobs:
   create-release:
     needs: build-and-release
     runs-on: ubuntu-latest
+    # Only this job creates the GitHub release, so only it gets write access to repo contents; the repo's default
+    # workflow token stays read-only (the build job needs no write).
+    permissions:
+      contents: write
     
     steps:
     - name: Download all artifacts
