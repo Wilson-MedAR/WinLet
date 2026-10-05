@@ -79,9 +79,16 @@ public class ConfigLoader
         {
             table = Toml.ToModel(tomlContent);
         }
-        catch (Exception) when (PreprocessTomlContent(tomlContent) != tomlContent)
+        catch (Exception)
         {
-            table = Toml.ToModel(PreprocessTomlContent(tomlContent));
+            // Not in an exception filter: the preprocessor may throw a ConfigurationException ("mixed backslashes"),
+            // and an exception thrown inside a filter is swallowed.
+            var preprocessed = PreprocessTomlContent(tomlContent);
+            if (preprocessed == tomlContent)
+            {
+                throw;
+            }
+            table = Toml.ToModel(preprocessed);
         }
 
         // A valid parse can still hide an unescaped path: "C:\temp" is legal TOML whose \t is a TAB. No config value
@@ -119,32 +126,38 @@ public class ConfigLoader
         return null;
     }
 
+    // ONLY `key = "single-line basic string"` lines, optionally followed by a comment, whose value starts like a
+    // Windows path ("X:\..." or "\\..."). Narrow on purpose: the fallback can never reach into literal strings
+    // ('...'), multi-line strings, comments, arrays, or a second string on the same line.
+    private static readonly Regex WindowsPathValueLine = new(
+        @"^(?<lead>[ \t]*[A-Za-z0-9_.-]+[ \t]*=[ \t]*)""(?<body>(?:[A-Za-z]:\\|\\\\)[^""\r\n]*)""(?<tail>[ \t]*(?:#[^\r\n]*)?)$",
+        RegexOptions.Multiline);
+
     /// <summary>
-    /// LEGACY fallback only (see ParseToml): escape raw backslashes in double-quoted Windows paths
+    /// LEGACY fallback only (see ParseToml): escape a RAW Windows path written in a double-quoted value. Per value:
+    /// - already a valid TOML basic string: untouched (never re-double a correctly escaped "C:\\..." beside a raw one);
+    /// - raw (no "\\" pair, except a leading UNC "\\"): every backslash is escaped, as before;
+    /// - MIXED ("C:\\Users\x": an escaped pair AND a raw backslash): refused. Guessing would corrupt one half.
     /// </summary>
-    /// <param name="tomlContent">Original TOML content</param>
-    /// <returns>Processed TOML content with properly escaped backslashes</returns>
     private static string PreprocessTomlContent(string tomlContent)
     {
-        // Pattern to match Windows paths in double quotes that contain backslashes
-        // This matches strings like "C:\Program Files\..." or "C:\Users\..." or "\\server\share\..."
-        var windowsPathPattern = @"""([A-Za-z]:\\[^""]*?|\\\\[^""]*?)""";
-        
-        var result = Regex.Replace(tomlContent, windowsPathPattern, match =>
+        return WindowsPathValueLine.Replace(tomlContent, match =>
         {
-            var originalPath = match.Groups[1].Value;
-            // PER STRING: leave a string that is already a valid TOML basic string alone. Only a string that is
-            // invalid on its own (a raw "C:\Users\...") is escaped. Otherwise one raw path in a document re-doubled
-            // every correctly escaped "C:\\..." string beside it, which is the corruption this fallback must not cause.
-            if (IsValidBasicString(originalPath))
+            var body = match.Groups["body"].Value;
+            if (IsValidBasicString(body))
             {
                 return match.Value;
             }
-            var escapedPath = originalPath.Replace(@"\", @"\\");
-            return $"\"{escapedPath}\"";
+            var afterUncPrefix = body.StartsWith(@"\\", StringComparison.Ordinal) ? body.Substring(2) : body;
+            if (afterUncPrefix.Contains(@"\\"))
+            {
+                var key = match.Groups["lead"].Value.Split('=')[0].Trim();
+                throw new ConfigurationException(
+                    $"Configuration value '{key}' mixes escaped (\\\\) and raw (\\) backslashes, so it can't be read safely. " +
+                    "Write it as a literal string ('C:\\path') or escape every backslash (\"C:\\\\path\").");
+            }
+            return match.Groups["lead"].Value + "\"" + body.Replace(@"\", @"\\") + "\"" + match.Groups["tail"].Value;
         });
-
-        return result;
     }
 
     private static bool IsValidBasicString(string content)

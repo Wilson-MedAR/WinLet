@@ -76,6 +76,42 @@ public class ConfigLoaderBackslashTests
     }
 
     [Fact]
+    public void MixedWithinOneString_IsRefusedNotGuessed()
+    {
+        // "C:\\Users\x": a valid escaped pair plus a raw backslash. Doubling all would corrupt the escaped half.
+        var ex = Assert.Throws<ConfigurationException>(() =>
+            Load("executable = \"node\"\narguments = \"C:\\\\Users\\x\\run.js\""));
+        Assert.Contains("'arguments'", ex.Message);
+        Assert.Contains("mixes escaped", ex.Message);
+    }
+
+    [Fact]
+    public void RawUncPath_IsStillRescued()
+    {
+        var config = Load("executable = \"node\"", "SHARE = \"\\\\fixturehost\\share\\x\"");
+        Assert.Equal(@"\\fixturehost\share\x", config.Process.Environment["SHARE"]);
+    }
+
+    [Fact]
+    public void Fallback_NeverReachesIntoALiteralString()
+    {
+        // The document fails to parse (raw executable), so the fallback runs. The old finder matched the quoted
+        // "C:\x" INSIDE the literal string and doubled it.
+        var config = Load(
+            "executable = \"C:\\Program Files\\nodejs\\node.exe\"\n" +
+            "arguments = 'run \"C:\\x\" now'");
+        Assert.Equal(@"C:\Program Files\nodejs\node.exe", config.Process.Executable);
+        Assert.Equal("run \"C:\\x\" now", config.Process.Arguments);
+    }
+
+    [Fact]
+    public void Fallback_LeavesATrailingCommentAlone()
+    {
+        var config = Load("executable = \"C:\\Program Files\\nodejs\\node.exe\"   # was \"C:\\old\\node.exe\"");
+        Assert.Equal(@"C:\Program Files\nodejs\node.exe", config.Process.Executable);
+    }
+
+    [Fact]
     public void UnescapedPathThatHappensToBeValidToml_IsRefusedNotMangled()
     {
         // "C:\temp" parses (\t is a TAB). Refuse loudly instead of running with a mangled value.
