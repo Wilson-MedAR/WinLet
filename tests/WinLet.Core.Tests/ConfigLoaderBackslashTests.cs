@@ -170,6 +170,49 @@ public class ConfigLoaderBackslashTests
     }
 
     [Fact]
+    public void CrlfRescue_KeepsTheCrInAMultiLineValue()
+    {
+        // REV Low: the rescue used to normalize the whole document to LF, so a multi-line value lost its CRs.
+        var config = ConfigLoader.LoadFromString(
+            "[service]\r\nname = \"sd018-test\"\r\ndisplay_name = \"sd018-test\"\r\n\r\n" +
+            "[process]\r\nexecutable = \"C:\\Program Files\\nodejs\\node.exe\"\r\n\r\n" +
+            "[process.environment]\r\nBANNER = \"\"\"\r\nline one\r\nline two\"\"\"\r\n");
+        Assert.Equal(@"C:\Program Files\nodejs\node.exe", config.Process.Executable);
+        Assert.Equal("line one\r\nline two", config.Process.Environment["BANNER"]);
+    }
+
+    [Fact]
+    public void NonPathTab_IsAlwaysRefused()
+    {
+        var ex = Assert.Throws<ConfigurationException>(() => Load("executable = \"node\"\narguments = \"a\\tb\""));
+        Assert.Contains("process.arguments", ex.Message);
+    }
+
+    [Fact]
+    public void TabInsideAnArrayItem_IsRefused()
+    {
+        var ex = Assert.Throws<ConfigurationException>(() => Load("executable = \"node\"\nextra = [\"C:\\\\ok\", \"a\\tb\"]"));
+        Assert.Contains("process.extra", ex.Message);
+    }
+
+    [Fact]
+    public void NewlineOutsideFreeText_IsRefused()
+    {
+        // CR/LF are allowed only in environment values and descriptions; an argument with a newline is refused.
+        var ex = Assert.Throws<ConfigurationException>(() => Load("executable = \"node\"\narguments = \"one\\ntwo\""));
+        Assert.Contains("process.arguments", ex.Message);
+    }
+
+    [Fact]
+    public void MultiLineDescription_IsAllowed()
+    {
+        var config = ConfigLoader.LoadFromString(
+            "[service]\nname = \"sd018-test\"\ndisplay_name = \"sd018-test\"\ndescription = \"line one\\nline two\"\n\n" +
+            "[process]\nexecutable = \"node\"\n");
+        Assert.Equal("line one\nline two", config.Description);
+    }
+
+    [Fact]
     public void InvalidToml_ThatThePreprocessorCannotChange_ReportsTheParseError()
     {
         var ex = Assert.Throws<ConfigurationException>(() => Load("executable = \"node"));

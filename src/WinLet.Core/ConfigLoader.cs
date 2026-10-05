@@ -83,10 +83,10 @@ public class ConfigLoader
         {
             // Not in an exception filter: the preprocessor may throw a ConfigurationException ("mixed backslashes"),
             // and an exception thrown inside a filter is swallowed.
-            // Line endings are normalized for the rescue only (the line pattern is LF-anchored; generators write CRLF).
-            var normalized = tomlContent.Replace("\r\n", "\n");
-            var preprocessed = PreprocessTomlContent(normalized);
-            if (preprocessed == normalized)
+            // The line patterns accept an optional CR before each line end and keep it, so a CRLF document is rescued
+            // without rewriting its line endings (a multi-line value keeps its CRs).
+            var preprocessed = PreprocessTomlContent(tomlContent);
+            if (preprocessed == tomlContent)
             {
                 throw;
             }
@@ -94,8 +94,9 @@ public class ConfigLoader
         }
 
         // A valid parse can still hide an unescaped path: "C:\temp" is legal TOML whose \t is a TAB. Refuse instead of
-        // starting a process with a mangled path. Tab, backspace and form feed are never legitimate in a config value;
-        // a newline is (a multi-line env value), so CR/LF refuse only in a value that starts like a Windows path.
+        // starting a process with a mangled path. Tab, backspace and form feed are never legitimate in a config value.
+        // CR/LF are legitimate only in free text, so they are allowed only in environment values and descriptions,
+        // and never in a value that starts like a Windows path ("C:\new" is the unescaped-path case).
         var bad = FindMangledValue(table, string.Empty);
         if (bad != null)
         {
@@ -107,9 +108,20 @@ public class ConfigLoader
         return table;
     }
 
-    private static bool LooksMangled(string s) =>
-        s.Any(c => c is '\t' or '\b' or '\f' || (char.IsControl(c) && c is not '\n' and not '\r')) ||
-        (Regex.IsMatch(s, @"^(?:[A-Za-z]:|\\)") && s.Any(c => c is '\n' or '\r'));
+    private static bool LooksMangled(string s, string path)
+    {
+        if (s.Any(c => char.IsControl(c) && c is not '\n' and not '\r'))
+        {
+            return true;   // tab, backspace, form feed, ...: never legitimate
+        }
+        if (!s.Any(c => c is '\n' or '\r'))
+        {
+            return false;
+        }
+        var freeText = path.StartsWith("process.environment.", StringComparison.Ordinal) ||
+                       path.EndsWith(".description", StringComparison.Ordinal) || path == "description";
+        return !freeText || Regex.IsMatch(s, @"^(?:[A-Za-z]:|\\)");
+    }
 
     private static string? FindMangledValue(TomlTable table, string prefix)
     {
@@ -118,14 +130,14 @@ public class ConfigLoader
             var path = prefix.Length == 0 ? key : $"{prefix}.{key}";
             switch (value)
             {
-                case string s when LooksMangled(s):
+                case string s when LooksMangled(s, path):
                     return path;
                 case TomlTable nested when FindMangledValue(nested, path) is { } hit:
                     return hit;
                 case TomlArray array:
                     foreach (var item in array)
                     {
-                        if (item is string a && LooksMangled(a)) return path;
+                        if (item is string a && LooksMangled(a, path)) return path;
                     }
                     break;
             }
@@ -136,10 +148,11 @@ public class ConfigLoader
     // ONLY `key = "single-line basic string"` lines, optionally followed by a comment, whose value starts like a
     // Windows path ("X:\..." or "\\..."). Narrow on purpose: the fallback can never reach into literal strings
     // ('...'), multi-line strings, comments, arrays, or a second string on the same line.
-    private static readonly Regex TableHeader = new(@"^[ \t]*\[(?<name>[^\[\]\r\n]+)\][ \t]*(?:#[^\r\n]*)?$", RegexOptions.Multiline);
+    // Both patterns allow an optional CR before the line end (CRLF documents) and the rewrite keeps it.
+    private static readonly Regex TableHeader = new(@"^[ \t]*\[(?<name>[^\[\]\r\n]+)\][ \t]*(?:#[^\r\n]*)?\r?$", RegexOptions.Multiline);
 
     private static readonly Regex WindowsPathValueLine = new(
-        @"^(?<lead>[ \t]*[A-Za-z0-9_.-]+[ \t]*=[ \t]*)""(?<body>(?:[A-Za-z]:\\|\\\\)[^""\r\n]*)""(?<tail>[ \t]*(?:#[^\r\n]*)?)$",
+        @"^(?<lead>[ \t]*[A-Za-z0-9_.-]+[ \t]*=[ \t]*)""(?<body>(?:[A-Za-z]:\\|\\\\)[^""\r\n]*)""(?<tail>[ \t]*(?:#[^\r\n]*)?)(?<cr>\r?)$",
         RegexOptions.Multiline);
 
     /// <summary>
@@ -170,7 +183,7 @@ public class ConfigLoader
                     $"Configuration value '{key}' mixes escaped (\\\\) and raw (\\) backslashes, so it can't be read safely. " +
                     "Write it as a literal string ('C:\\path') or escape every backslash (\"C:\\\\path\").");
             }
-            return match.Groups["lead"].Value + "\"" + body.Replace(@"\", @"\\") + "\"" + match.Groups["tail"].Value;
+            return match.Groups["lead"].Value + "\"" + body.Replace(@"\", @"\\") + "\"" + match.Groups["tail"].Value + match.Groups["cr"].Value;
         });
     }
 
